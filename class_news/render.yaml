@@ -7,8 +7,8 @@ services:
     envVars:
       - key: ADMIN_KEY
         sync: false
-      - key: DATABASE_PATH
-        value: /var/data/class_news.db
+      - key: DATA_DIR
+        value: /var/data
     disk:
       name: class-news-data
       mountPath: /var/data

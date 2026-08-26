@@ -1,183 +1,152 @@
-import os
-import secrets
-import sqlite3
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
+import os
+import sqlite3
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+LOCAL_UPLOAD_DIR = BASE_DIR / "uploads"
+
+# Render Persistent Disk: set DATA_DIR=/var/data
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "class_news.db"
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "100525")
-DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "class_news.db"))
-UPLOAD_ROOT = Path(DATABASE_PATH).parent if Path(DATABASE_PATH).is_absolute() else BASE_DIR
-UPLOAD_DIR = UPLOAD_ROOT / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+KST = timezone(timedelta(hours=9))
 
 app = FastAPI(title="우리반 뉴스")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# IMPORTANT: paths are based on main.py, so Render Root Directory can be blank.
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 def db():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
 def init_db():
     conn = db()
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS news (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             content TEXT NOT NULL,
-            image TEXT,
+            image_url TEXT,
             likes INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS likes (
-            news_id INTEGER NOT NULL,
-            visitor_id TEXT NOT NULL,
-            PRIMARY KEY (news_id, visitor_id),
-            FOREIGN KEY(news_id) REFERENCES news(id) ON DELETE CASCADE
-        );
+        )
         """
     )
+    conn.commit()
     conn.close()
 
 
 init_db()
 
 
-def admin_ok(request: Request) -> bool:
-    return request.cookies.get("admin_session") == request.app.state.admin_session
+def now_text() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
 
-@app.on_event("startup")
-def startup():
-    app.state.admin_session = secrets.token_urlsafe(32)
+def check_admin(key: str):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="관리자 키가 올바르지 않습니다.")
 
 
-def ensure_visitor(request: Request, response):
-    visitor_id = request.cookies.get("visitor_id")
-    if not visitor_id:
-        visitor_id = str(uuid.uuid4())
-        response.set_cookie("visitor_id", visitor_id, max_age=60 * 60 * 24 * 365, samesite="lax")
-    return visitor_id
+def safe_name(name: str) -> str:
+    base = Path(name).name
+    stamp = datetime.now(KST).strftime("%Y%m%d%H%M%S%f")
+    return f"{stamp}_{base.replace(' ', '_')}"
 
 
-def news_dict(row, visitor_id=None):
-    liked = False
-    if visitor_id:
-        conn = db()
-        liked = conn.execute(
-            "SELECT 1 FROM likes WHERE news_id=? AND visitor_id=?",
-            (row["id"], visitor_id),
-        ).fetchone() is not None
-        conn.close()
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "content": row["content"],
-        "image": row["image"],
-        "likes": row["likes"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "liked": liked,
-    }
-
-
-@app.get("/", response_class=HTMLResponse)
-def home():
+@app.get("/")
+def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.get("/admin", response_class=HTMLResponse)
+@app.get("/admin")
 def admin_page():
     return FileResponse(STATIC_DIR / "admin.html")
 
 
 @app.get("/api/news")
-def get_news(request: Request):
-    visitor_id = request.cookies.get("visitor_id")
+def list_news():
     conn = db()
-    rows = conn.execute("SELECT * FROM news ORDER BY created_at DESC, id DESC").fetchall()
+    rows = conn.execute("SELECT * FROM news ORDER BY id DESC").fetchall()
     conn.close()
-    return [news_dict(row, visitor_id) for row in rows]
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/news/{news_id}")
-def get_one_news(news_id: int, request: Request):
-    visitor_id = request.cookies.get("visitor_id")
+def get_news(news_id: int):
     conn = db()
     row = conn.execute("SELECT * FROM news WHERE id=?", (news_id,)).fetchone()
     conn.close()
     if not row:
-        raise HTTPException(404, "뉴스를 찾을 수 없습니다.")
-    return news_dict(row, visitor_id)
+        raise HTTPException(status_code=404, detail="뉴스를 찾을 수 없습니다.")
+    return dict(row)
 
 
 @app.post("/api/admin/login")
-def admin_login(payload: dict):
-    if str(payload.get("key", "")) != ADMIN_KEY:
-        raise HTTPException(401, "관리자 키가 올바르지 않습니다.")
-    response = JSONResponse({"ok": True})
-    response.set_cookie("admin_session", app.state.admin_session, httponly=True, samesite="lax", max_age=60 * 60 * 12)
-    return response
+def admin_login(key: str = Form(...)):
+    check_admin(key)
+    return {"ok": True}
 
 
-@app.post("/api/admin/logout")
-def admin_logout():
-    response = JSONResponse({"ok": True})
-    response.delete_cookie("admin_session")
-    return response
-
-
-@app.get("/api/admin/me")
-def admin_me(request: Request):
-    return {"admin": admin_ok(request)}
-
-
-@app.post("/api/admin/news")
+@app.post("/api/news")
 async def create_news(
-    request: Request,
+    key: str = Form(...),
     title: str = Form(...),
     content: str = Form(...),
-    image: UploadFile | None = File(None),
+    image: Optional[UploadFile] = File(None),
 ):
-    if not admin_ok(request):
-        raise HTTPException(401, "관리자 인증이 필요합니다.")
+    check_admin(key)
     title = title.strip()
     content = content.strip()
     if not title or not content:
-        raise HTTPException(400, "제목과 내용을 입력해주세요.")
+        raise HTTPException(status_code=400, detail="제목과 내용을 입력해주세요.")
 
     image_url = None
     if image and image.filename:
-        ext = Path(image.filename).suffix.lower()
         allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+        ext = Path(image.filename).suffix.lower()
         if ext not in allowed:
-            raise HTTPException(400, "JPG, PNG, GIF, WEBP 이미지만 업로드할 수 있습니다.")
+            raise HTTPException(status_code=400, detail="JPG, PNG, GIF, WEBP 이미지만 업로드할 수 있습니다.")
+        filename = safe_name(image.filename)
+        target = UPLOAD_DIR / filename
         data = await image.read()
         if len(data) > 8 * 1024 * 1024:
-            raise HTTPException(400, "이미지는 8MB 이하로 업로드해주세요.")
-        filename = f"{uuid.uuid4().hex}{ext}"
-        (UPLOAD_DIR / filename).write_bytes(data)
+            raise HTTPException(status_code=400, detail="이미지는 8MB 이하만 업로드할 수 있습니다.")
+        target.write_bytes(data)
         image_url = f"/uploads/{filename}"
 
-    now = datetime.now(timezone.utc).isoformat()
+    timestamp = now_text()
     conn = db()
     cur = conn.execute(
-        "INSERT INTO news(title, content, image, created_at, updated_at) VALUES(?,?,?,?,?)",
-        (title, content, image_url, now, now),
+        "INSERT INTO news (title, content, image_url, likes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
+        (title, content, image_url, timestamp, timestamp),
     )
     conn.commit()
     news_id = cur.lastrowid
@@ -185,94 +154,82 @@ async def create_news(
     return {"ok": True, "id": news_id}
 
 
-@app.put("/api/admin/news/{news_id}")
+@app.put("/api/news/{news_id}")
 async def update_news(
     news_id: int,
-    request: Request,
+    key: str = Form(...),
     title: str = Form(...),
     content: str = Form(...),
+    image: Optional[UploadFile] = File(None),
     remove_image: bool = Form(False),
-    image: UploadFile | None = File(None),
 ):
-    if not admin_ok(request):
-        raise HTTPException(401, "관리자 인증이 필요합니다.")
-    conn = db()
-    row = conn.execute("SELECT * FROM news WHERE id=?", (news_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "뉴스를 찾을 수 없습니다.")
+    check_admin(key)
+    title = title.strip()
+    content = content.strip()
+    if not title or not content:
+        raise HTTPException(status_code=400, detail="제목과 내용을 입력해주세요.")
 
-    image_url = row["image"]
+    conn = db()
+    old = conn.execute("SELECT image_url FROM news WHERE id=?", (news_id,)).fetchone()
+    if not old:
+        conn.close()
+        raise HTTPException(status_code=404, detail="뉴스를 찾을 수 없습니다.")
+
+    image_url = old["image_url"]
     if remove_image:
         image_url = None
     if image and image.filename:
+        allowed = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
         ext = Path(image.filename).suffix.lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        if ext not in allowed:
             conn.close()
-            raise HTTPException(400, "JPG, PNG, GIF, WEBP 이미지만 업로드할 수 있습니다.")
+            raise HTTPException(status_code=400, detail="JPG, PNG, GIF, WEBP 이미지만 업로드할 수 있습니다.")
         data = await image.read()
         if len(data) > 8 * 1024 * 1024:
             conn.close()
-            raise HTTPException(400, "이미지는 8MB 이하로 업로드해주세요.")
-        filename = f"{uuid.uuid4().hex}{ext}"
+            raise HTTPException(status_code=400, detail="이미지는 8MB 이하만 업로드할 수 있습니다.")
+        filename = safe_name(image.filename)
         (UPLOAD_DIR / filename).write_bytes(data)
         image_url = f"/uploads/{filename}"
 
-    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "UPDATE news SET title=?, content=?, image=?, updated_at=? WHERE id=?",
-        (title.strip(), content.strip(), image_url, now, news_id),
+        "UPDATE news SET title=?, content=?, image_url=?, updated_at=? WHERE id=?",
+        (title, content, image_url, now_text(), news_id),
     )
     conn.commit()
     conn.close()
     return {"ok": True}
 
 
-@app.delete("/api/admin/news/{news_id}")
-def delete_news(news_id: int, request: Request):
-    if not admin_ok(request):
-        raise HTTPException(401, "관리자 인증이 필요합니다.")
+@app.delete("/api/news/{news_id}")
+def delete_news(news_id: int, key: str):
+    check_admin(key)
     conn = db()
-    row = conn.execute("SELECT image FROM news WHERE id=?", (news_id,)).fetchone()
+    row = conn.execute("SELECT image_url FROM news WHERE id=?", (news_id,)).fetchone()
     if not row:
         conn.close()
-        raise HTTPException(404, "뉴스를 찾을 수 없습니다.")
-    conn.execute("DELETE FROM likes WHERE news_id=?", (news_id,))
+        raise HTTPException(status_code=404, detail="뉴스를 찾을 수 없습니다.")
     conn.execute("DELETE FROM news WHERE id=?", (news_id,))
     conn.commit()
     conn.close()
-    if row["image"] and row["image"].startswith("/uploads/"):
-        p = UPLOAD_DIR / row["image"].split("/uploads/", 1)[1]
-        if p.exists():
-            p.unlink()
+    if row["image_url"]:
+        file_path = UPLOAD_DIR / Path(row["image_url"]).name
+        if file_path.exists():
+            try:
+                file_path.unlink()
+            except OSError:
+                pass
     return {"ok": True}
 
 
 @app.post("/api/news/{news_id}/like")
-def like_news(news_id: int, request: Request):
+def like_news(news_id: int):
     conn = db()
-    row = conn.execute("SELECT id, likes FROM news WHERE id=?", (news_id,)).fetchone()
-    if not row:
+    cur = conn.execute("UPDATE news SET likes = likes + 1 WHERE id=?", (news_id,))
+    conn.commit()
+    if cur.rowcount == 0:
         conn.close()
-        raise HTTPException(404, "뉴스를 찾을 수 없습니다.")
-
-    visitor_id = request.cookies.get("visitor_id")
-    if not visitor_id:
-        visitor_id = str(uuid.uuid4())
-
-    already = conn.execute(
-        "SELECT 1 FROM likes WHERE news_id=? AND visitor_id=?",
-        (news_id, visitor_id),
-    ).fetchone()
-    response = JSONResponse({"ok": True, "liked": bool(already), "likes": row["likes"]})
-
-    if not already:
-        conn.execute("INSERT INTO likes(news_id, visitor_id) VALUES(?,?)", (news_id, visitor_id))
-        conn.execute("UPDATE news SET likes=likes+1 WHERE id=?", (news_id,))
-        conn.commit()
-        new_count = row["likes"] + 1
-        response = JSONResponse({"ok": True, "liked": True, "likes": new_count})
-
+        raise HTTPException(status_code=404, detail="뉴스를 찾을 수 없습니다.")
+    row = conn.execute("SELECT likes FROM news WHERE id=?", (news_id,)).fetchone()
     conn.close()
-    response.set_cookie("visitor_id", visitor_id, max_age=60 * 60 * 24 * 365, samesite="lax")
-    return response
+    return {"ok": True, "likes": row["likes"]}

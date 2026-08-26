@@ -1,26 +1,31 @@
-# 📰 우리반 뉴스
+# 우리반 뉴스
 
-관리자만 뉴스를 올리고, 학생들은 뉴스와 이미지를 보고 좋아요만 누를 수 있는 반 전용 뉴스 웹입니다.
+관리자만 뉴스 작성/수정/삭제를 할 수 있고, 학생은 뉴스에 좋아요만 누를 수 있는 간단한 반 뉴스 사이트입니다.
 
-## 로컬 실행
+## 기본 관리자 키
+`100525`
 
-```bash
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-브라우저에서 `http://127.0.0.1:8000` 접속.
-
-관리자 페이지: `http://127.0.0.1:8000/admin`
-
-기본 관리자 키: `100525`
+실제 배포에서는 Render Environment Variable `ADMIN_KEY`에 설정하세요.
 
 ## Render 배포
+ZIP을 풀어서 **파일과 폴더를 GitHub 저장소 최상위**에 올립니다.
 
-`render.yaml`이 포함되어 있어서 GitHub에 올린 뒤 Render에서 해당 저장소를 선택하면 설정을 불러올 수 있습니다.
+정상 구조:
 
-Render 환경변수 `ADMIN_KEY`를 `100525`로 설정하세요. `DATABASE_PATH`와 디스크 설정은 `render.yaml`에 넣어 두었습니다.
+```text
+main.py
+requirements.txt
+render.yaml
+static/
+uploads/
+```
 
-### 참고
+따라서 Render의 **Root Directory는 비워둡니다.**
 
-이미지는 현재 Render 디스크의 `/var/data`가 아닌 프로젝트의 `uploads` 폴더에 저장됩니다. 영구 이미지 저장이 필요하면 나중에 Cloudinary 같은 외부 이미지 스토리지로 교체하는 것을 권장합니다. DB는 Render 디스크에 저장되도록 설정되어 있습니다.
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+
+`render.yaml`을 사용하면 `/var/data` 영구 디스크, `DATA_DIR` 설정 등을 같이 적용할 수 있습니다. Render 대시보드에서 디스크 설정이 자동 적용되지 않으면 Web Service의 Disks에서 `/var/data` 디스크를 추가하세요.
+
+## 관리자 페이지
+배포 후 `/admin` 접속 → 관리자 키 `100525` 입력.
